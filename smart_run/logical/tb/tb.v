@@ -240,8 +240,65 @@ reg [39:0] cpu_awaddr;
 reg [3:0]  cpu_awlen;
 reg [15:0] cpu_wstrb;
 reg        cpu_wvalid;
+reg [127:0] cpu_wdata;
 reg [63:0] value0;
 reg [63:0] value1;
+
+`ifdef CX_TRACE
+integer cx_trace_file;
+reg [4095:0] cx_trace_path;
+
+initial
+begin
+  if(!$value$plusargs("cx_trace=%s", cx_trace_path)) begin
+    cx_trace_path = "openc906_trace_hart_00000000.log";
+  end
+  cx_trace_file = $fopen(cx_trace_path, "w");
+end
+
+always @(posedge clk)
+begin
+  if(cx_trace_file != 0) begin
+    if(`tb_retire0) begin
+      $fwrite(cx_trace_file, "commit cycle=%0d hart=0 pc=0x%010x", cycle_count[31:0], `retire0_pc);
+      if(`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_dp.dp_retire_ex2_inst_expt) begin
+        $fwrite(cx_trace_file, " exc_cause=%0d", `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_dp.dp_retire_ex2_vec[4:0]);
+      end
+      $fwrite(cx_trace_file, "\n");
+    end
+    if(`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_vld &&
+       (`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_reg[4:0] != 5'd0)) begin
+      $fwrite(cx_trace_file, "regwrite cycle=%0d hart=0 rd=x%0d rd_val=0x%016x\n",
+              cycle_count[31:0],
+              `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_reg[4:0],
+              `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_data[63:0]);
+    end
+    if(`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_vld &&
+       (`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_reg[4:0] != 5'd0)) begin
+      $fwrite(cx_trace_file, "regwrite cycle=%0d hart=0 rd=x%0d rd_val=0x%016x\n",
+              cycle_count[31:0],
+              `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_reg[4:0],
+              `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_data[63:0]);
+    end
+    if(`CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_vld) begin
+      $fwrite(cx_trace_file, "fpwrite cycle=%0d hart=0 rd=f%0d rd_val=0x%016x\n",
+              cycle_count[31:0],
+              `CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_reg[4:0],
+              `CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_data[63:0]);
+    end
+    if(cpu_wvalid && (cpu_awaddr[31:0] >= 32'h00040000) && (cpu_awaddr[31:0] < 32'h00100000)) begin
+      $fwrite(cx_trace_file, "store cycle=%0d hart=0 addr=0x%010x mask=0x%04x data=0x%032x\n",
+              cycle_count[31:0], {8'h0, cpu_awaddr[31:0]}, cpu_wstrb[15:0], cpu_wdata[127:0]);
+    end
+    if(`tb_retire0 || cpu_wvalid ||
+       `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_vld ||
+       `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_vld ||
+       `CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_vld) begin
+      $fflush(cx_trace_file);
+    end
+  end
+end
+`endif
 
 
 always @(posedge clk)
@@ -250,6 +307,7 @@ begin
   cpu_awaddr[31:0] <= `SOC_TOP.biu_pad_awaddr[31:0];
   cpu_wvalid       <= `SOC_TOP.biu_pad_wvalid;
   cpu_wstrb        <= `SOC_TOP.biu_pad_wstrb;
+  cpu_wdata        <= `SOC_TOP.biu_pad_wdata[127:0];
   value0           <= `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.wb_wb0_data[63:0];
   value1           <= `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.wb_wb1_data[63:0];
 end
