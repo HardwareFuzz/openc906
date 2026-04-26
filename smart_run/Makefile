@@ -21,6 +21,13 @@ include ./setup/env_check.mk
 ################################################################################
 SIM = iverilog
 DUMP = off
+THREADS = 4
+
+# Verilator-specific flags
+VERILATOR_FLAGS += -cc --exe
+VERILATOR_FLAGS += -O3 -x-assign 0
+VERILATOR_FLAGS += -lint-only
+VERILATOR_FLAGS += -Wno-fatal
 
 ifeq ($(DUMP), on)
 SIM_DUMP :=
@@ -45,10 +52,17 @@ else
     SIMULATOR_LOG := -l comp.nc.log
     else
     ifeq ($(SIM), iverilog)
-      TIMESCALE := 
-      SIMULATOR_OPT := -o xuantie_core.vvp -Diverilog=1 -g2012 
+      TIMESCALE :=
+      SIMULATOR_OPT := -o xuantie_core.vvp -Diverilog=1 -g2012
       SIMULATOR_DEF := -DIVERILOG_SIM
-      SIMULATOR_LOG := 
+      SIMULATOR_LOG :=
+    else
+      ifeq ($(SIM), verilator)
+        TIMESCALE :=
+        SIMULATOR_OPT := -O3 -x-assign 0 --timing -Wno-fatal --threads ${THREADS}
+        SIMULATOR_DEF := -cc --exe --top-module top
+        SIMULATOR_LOG :=
+      endif
     endif
     endif
 endif
@@ -56,7 +70,11 @@ endif
 ifeq ($(SIM), iverilog)
 SIM_FILELIST := $(SIM_FILELIST) -f ${CODE_BASE_PATH}/gen_rtl/filelists/C906_asic_rtl.fl -f ${CODE_BASE_PATH}/gen_rtl/filelists/tdt_dmi_top_rtl.fl -c ../logical/filelists/smart.fl -c ../logical/filelists/tb.fl
 else
+ifeq ($(SIM), verilator)
+SIM_FILELIST := $(SIM_FILELIST) -f ${CODE_BASE_PATH}/gen_rtl/filelists/C906_asic_rtl.fl -f ${CODE_BASE_PATH}/gen_rtl/filelists/tdt_dmi_top_rtl.fl -f ../logical/filelists/smart.fl -f ../logical/filelists/sim_verilator.fl
+else
 SIM_FILELIST := $(SIM_FILELIST) -f ../logical/filelists/sim.fl
+endif
 endif
 
 compile:
@@ -72,10 +90,18 @@ else
         ifeq ($(SIM), iverilog)
 	  @cd ./work && iverilog $(TIMESCALE) $(SIMULATOR_OPT) $(SIMULATOR_DEF) $(SIM_FILELIST) $(SIM_DUMP) $(SIMULATOR_LOG)
         else
-	  @echo "  [THead-smart] Please specify SIM = vcs to use VCS, or SIM = nc to use irun ..."
+            ifeq ($(SIM), verilator)
+	      @cd ./work && verilator $(SIMULATOR_OPT) $(SIMULATOR_DEF) $(SIMULATOR_LOG) $(SIM_FILELIST) $(SIM_DUMP)
+            else
+	      @echo "  [THead-smart] Please specify SIM = vcs to use VCS, or SIM = nc to use irun, or SIM = verilator ..."
+            endif
         endif
-    endif 
-endif 
+    endif
+endif
+
+buildVerilator:
+	@cp ./logical/tb/Makefile_obj ./work/Makefile_obj
+	@cd ./work && make -j -C obj_dir -f ../Makefile_obj
 
 cleansim:
 	@cd ./work && rm -rf simv* csrc ucli.key *.vcs.log novas_dump.log *.fsdb
