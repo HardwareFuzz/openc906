@@ -39,6 +39,8 @@ limitations under the License.
 `define retire0_pc          `CPU_TOP.core0_pad_retire_pc[39:0]
 `define CPU_CLK             `CPU_TOP.pll_core_cpuclk
 `define CPU_RST             `CPU_TOP.pad_cpu_rst_b
+`define LSU_TOP             `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_lsu_top
+`define LSU_STB             `LSU_TOP.x_aq_lsu_stb
 
 
 
@@ -247,6 +249,58 @@ reg [63:0] value1;
 `ifdef CX_TRACE
 integer cx_trace_file;
 reg [4095:0] cx_trace_path;
+reg cx_trace_started;
+
+function [15:0] cx_trace_expand_store_bytes_vld;
+  input [39:0] raw_addr;
+  input [7:0] raw_bytes_vld;
+  begin
+    cx_trace_expand_store_bytes_vld = raw_addr[3]
+      ? {raw_bytes_vld, 8'b0}
+      : {8'b0, raw_bytes_vld};
+  end
+endfunction
+
+function [63:0] cx_trace_pack_store_data;
+  input [63:0] lane_data;
+  input [7:0] raw_bytes_vld;
+  integer src;
+  integer dst;
+  reg [63:0] packed_data;
+  reg [63:0] byte_value;
+  begin
+    packed_data = 64'b0;
+    dst = 0;
+    for (src = 0; src < 8; src = src + 1) begin
+      if (raw_bytes_vld[src]) begin
+        byte_value = (lane_data >> (src * 8)) & 64'hff;
+        packed_data = packed_data | (byte_value << (dst * 8));
+        dst = dst + 1;
+      end
+    end
+    cx_trace_pack_store_data = packed_data;
+  end
+endfunction
+
+task cx_trace_store_raw8;
+  input [31:0] raw_cycle;
+  input [39:0] raw_addr;
+  input [7:0] raw_bytes_vld;
+  input [63:0] lane_data;
+  begin
+    if(raw_bytes_vld != 8'b0 &&
+       raw_addr[31:0] >= 32'h00040000 &&
+       raw_addr[31:0] < 32'h00100000) begin
+      $fwrite(cx_trace_file,
+              "store_raw cycle=%0d hart=0 raw_addr=0x%010x raw_bytes_vld=0x%04x raw_data=0x%016x addr_cycle=%0d\n",
+              raw_cycle,
+              raw_addr,
+              cx_trace_expand_store_bytes_vld(raw_addr, raw_bytes_vld),
+              cx_trace_pack_store_data(lane_data, raw_bytes_vld),
+              raw_cycle);
+    end
+  end
+endtask
 
 initial
 begin
@@ -254,6 +308,7 @@ begin
     cx_trace_path = "openc906_trace_hart_00000000.log";
   end
   cx_trace_file = $fopen(cx_trace_path, "w");
+  cx_trace_started = 1'b0;
 end
 
 always @(posedge clk)
@@ -265,32 +320,121 @@ begin
         $fwrite(cx_trace_file, " exc_cause=%0d", `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_dp.dp_retire_ex2_vec[4:0]);
       end
       $fwrite(cx_trace_file, "\n");
+      cx_trace_started <= 1'b1;
     end
-    if(`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_vld &&
-       (`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_reg[4:0] != 5'd0)) begin
-      $fwrite(cx_trace_file, "regwrite cycle=%0d hart=0 rd=x%0d rd_val=0x%016x\n",
-              cycle_count[31:0],
-              `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_reg[4:0],
-              `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_data[63:0]);
-    end
-    if(`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_vld &&
-       (`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_reg[4:0] != 5'd0)) begin
-      $fwrite(cx_trace_file, "regwrite cycle=%0d hart=0 rd=x%0d rd_val=0x%016x\n",
-              cycle_count[31:0],
-              `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_reg[4:0],
-              `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_data[63:0]);
-    end
-    if(`CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_vld) begin
-      $fwrite(cx_trace_file, "fpwrite cycle=%0d hart=0 rd=f%0d rd_val=0x%016x\n",
-              cycle_count[31:0],
-              `CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_reg[4:0],
-              `CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_data[63:0]);
-    end
-    if(cpu_wvalid && (cpu_awaddr[31:0] >= 32'h00040000) && (cpu_awaddr[31:0] < 32'h00100000)) begin
-      $fwrite(cx_trace_file, "store cycle=%0d hart=0 addr=0x%010x mask=0x%04x data=0x%032x\n",
-              cycle_count[31:0], {8'h0, cpu_awaddr[31:0]}, cpu_wstrb[15:0], cpu_wdata[127:0]);
+    if(cx_trace_started || `tb_retire0) begin
+      if(`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_vld &&
+         (`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_reg[4:0] != 5'd0)) begin
+        $fwrite(cx_trace_file, "regwrite cycle=%0d hart=0 rd=x%0d rd_val=0x%016x\n",
+                cycle_count[31:0],
+                `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_reg[4:0],
+                `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_data[63:0]);
+      end
+      if(`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_vld &&
+         (`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_reg[4:0] != 5'd0)) begin
+        $fwrite(cx_trace_file, "regwrite cycle=%0d hart=0 rd=x%0d rd_val=0x%016x\n",
+                cycle_count[31:0],
+                `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_reg[4:0],
+                `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_data[63:0]);
+      end
+      if(`CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_vld) begin
+        $fwrite(cx_trace_file, "fpwrite cycle=%0d hart=0 rd=f%0d rd_val=0x%016x\n",
+                cycle_count[31:0],
+                `CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_reg[4:0],
+                `CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_data[63:0]);
+      end
+      if(`LSU_STB.stb_create_en_gate[0] &&
+         !`LSU_STB.stb_create_dca_inst &&
+         !`LSU_STB.stb_create_src2_depd) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_create_pa[39:0],
+                            `LSU_STB.stb_create_bytes_vld[7:0],
+                            `LSU_STB.stb_create_data[63:0]);
+      end
+      if(`LSU_STB.stb_create_en_gate[1] &&
+         !`LSU_STB.stb_create_dca_inst &&
+         !`LSU_STB.stb_create_src2_depd) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_create_pa[39:0],
+                            `LSU_STB.stb_create_bytes_vld[7:0],
+                            `LSU_STB.stb_create_data[63:0]);
+      end
+      if(`LSU_STB.stb_create_en_gate[2] &&
+         !`LSU_STB.stb_create_dca_inst &&
+         !`LSU_STB.stb_create_src2_depd) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_create_pa[39:0],
+                            `LSU_STB.stb_create_bytes_vld[7:0],
+                            `LSU_STB.stb_create_data[63:0]);
+      end
+      if(`LSU_STB.stb_create_en_gate[3] &&
+         !`LSU_STB.stb_create_dca_inst &&
+         !`LSU_STB.stb_create_src2_depd) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_create_pa[39:0],
+                            `LSU_STB.stb_create_bytes_vld[7:0],
+                            `LSU_STB.stb_create_data[63:0]);
+      end
+      if(`LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_vld) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_entry0_pa[39:0],
+                            `LSU_STB.stb_entry0_bytes_vld[7:0],
+                            `LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_data[63:0]);
+      end
+      if(`LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_vld) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_entry1_pa[39:0],
+                            `LSU_STB.stb_entry1_bytes_vld[7:0],
+                            `LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_data[63:0]);
+      end
+      if(`LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_vld) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_entry2_pa[39:0],
+                            `LSU_STB.stb_entry2_bytes_vld[7:0],
+                            `LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_data[63:0]);
+      end
+      if(`LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_vld) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_entry3_pa[39:0],
+                            `LSU_STB.stb_entry3_bytes_vld[7:0],
+                            `LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_data[63:0]);
+      end
+      if(`LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_vld) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_entry0_pa[39:0],
+                            `LSU_STB.stb_entry0_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                            `LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_data[63:0]);
+      end
+      if(`LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_vld) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_entry1_pa[39:0],
+                            `LSU_STB.stb_entry1_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                            `LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_data[63:0]);
+      end
+      if(`LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_vld) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_entry2_pa[39:0],
+                            `LSU_STB.stb_entry2_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                            `LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_data[63:0]);
+      end
+      if(`LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_vld) begin
+        cx_trace_store_raw8(cycle_count[31:0],
+                            `LSU_STB.stb_entry3_pa[39:0],
+                            `LSU_STB.stb_entry3_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                            `LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_data[63:0]);
+      end
     end
     if(`tb_retire0 || cpu_wvalid ||
+       `LSU_STB.stb_create_en_gate[0] || `LSU_STB.stb_create_en_gate[1] ||
+       `LSU_STB.stb_create_en_gate[2] || `LSU_STB.stb_create_en_gate[3] ||
+       `LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_vld ||
+       `LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_vld ||
+       `LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_vld ||
+       `LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_vld ||
+       `LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_vld ||
+       `LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_vld ||
+       `LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_vld ||
+       `LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_vld ||
        `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb0_vld ||
        `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_wb.rtu_idu_wb1_vld ||
        `CPU_TOP.x_aq_top_0.x_aq_core.vpu_vidu_fp_wb_vld) begin
