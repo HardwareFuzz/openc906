@@ -246,6 +246,117 @@ reg [63:0] value1;
 integer cx_trace_file;
 reg [4095:0] cx_trace_path;
 reg cx_trace_started;
+reg [31:0] cx_trace_last_commit_cycle;
+reg [39:0] cx_trace_last_commit_pc;
+reg cx_trace_last_commit_vld;
+reg [39:0] cx_trace_amo_pc [0:3];
+reg        cx_trace_amo_pc_vld [0:3];
+reg [39:0] cx_trace_store_pc [0:3];
+reg        cx_trace_store_pc_vld [0:3];
+reg [7:0]  cx_trace_store_bytes_vld [0:3];
+reg [1:0]  cx_trace_store_size [0:3];
+integer    cx_trace_slot;
+
+function [39:0] cx_trace_store_create_pc;
+  begin
+    if(`tb_retire0)
+      cx_trace_store_create_pc = `retire0_pc;
+    else
+      cx_trace_store_create_pc = {24'b0, `LSU_TOP.ag_dc_inst_pc[15:0]};
+  end
+endfunction
+
+function [7:0] cx_trace_store_mask_from_size;
+  input [1:0] raw_size;
+  begin
+    case(raw_size)
+      2'b00: cx_trace_store_mask_from_size = 8'h01;
+      2'b01: cx_trace_store_mask_from_size = 8'h03;
+      2'b10: cx_trace_store_mask_from_size = 8'h0f;
+      default: cx_trace_store_mask_from_size = 8'hff;
+    endcase
+  end
+endfunction
+
+function [7:0] cx_trace_fetch_mem_byte;
+  input [39:0] raw_addr;
+  integer line_idx;
+  begin
+    line_idx = raw_addr[17:4];
+    case (raw_addr[3:0])
+      4'h0: cx_trace_fetch_mem_byte = `RTL_MEM.ram0.mem[line_idx][7:0];
+      4'h1: cx_trace_fetch_mem_byte = `RTL_MEM.ram1.mem[line_idx][7:0];
+      4'h2: cx_trace_fetch_mem_byte = `RTL_MEM.ram2.mem[line_idx][7:0];
+      4'h3: cx_trace_fetch_mem_byte = `RTL_MEM.ram3.mem[line_idx][7:0];
+      4'h4: cx_trace_fetch_mem_byte = `RTL_MEM.ram4.mem[line_idx][7:0];
+      4'h5: cx_trace_fetch_mem_byte = `RTL_MEM.ram5.mem[line_idx][7:0];
+      4'h6: cx_trace_fetch_mem_byte = `RTL_MEM.ram6.mem[line_idx][7:0];
+      4'h7: cx_trace_fetch_mem_byte = `RTL_MEM.ram7.mem[line_idx][7:0];
+      4'h8: cx_trace_fetch_mem_byte = `RTL_MEM.ram8.mem[line_idx][7:0];
+      4'h9: cx_trace_fetch_mem_byte = `RTL_MEM.ram9.mem[line_idx][7:0];
+      4'ha: cx_trace_fetch_mem_byte = `RTL_MEM.ram10.mem[line_idx][7:0];
+      4'hb: cx_trace_fetch_mem_byte = `RTL_MEM.ram11.mem[line_idx][7:0];
+      4'hc: cx_trace_fetch_mem_byte = `RTL_MEM.ram12.mem[line_idx][7:0];
+      4'hd: cx_trace_fetch_mem_byte = `RTL_MEM.ram13.mem[line_idx][7:0];
+      4'he: cx_trace_fetch_mem_byte = `RTL_MEM.ram14.mem[line_idx][7:0];
+      default: cx_trace_fetch_mem_byte = `RTL_MEM.ram15.mem[line_idx][7:0];
+    endcase
+  end
+endfunction
+
+function [31:0] cx_trace_fetch_inst32;
+  input [39:0] raw_pc;
+  begin
+    cx_trace_fetch_inst32 = {cx_trace_fetch_mem_byte(raw_pc + 40'd3),
+                             cx_trace_fetch_mem_byte(raw_pc + 40'd2),
+                             cx_trace_fetch_mem_byte(raw_pc + 40'd1),
+                             cx_trace_fetch_mem_byte(raw_pc)};
+  end
+endfunction
+
+function [7:0] cx_trace_mask_for_width;
+  input [39:0] raw_addr;
+  input [3:0] width_bytes;
+  begin
+    case (width_bytes)
+      4'd1: cx_trace_mask_for_width = 8'h01 << raw_addr[2:0];
+      4'd2: cx_trace_mask_for_width = 8'h03 << raw_addr[2:0];
+      4'd4: cx_trace_mask_for_width = 8'h0f << raw_addr[2:0];
+      4'd8: cx_trace_mask_for_width = 8'hff;
+      default: cx_trace_mask_for_width = 8'h00;
+    endcase
+  end
+endfunction
+
+function [7:0] cx_trace_decode_store_bytes_vld;
+  input [39:0] raw_pc;
+  input [39:0] raw_addr;
+  input [7:0] fallback_bytes_vld;
+  reg [31:0] inst32;
+  begin
+    inst32 = cx_trace_fetch_inst32(raw_pc);
+    case (inst32[6:0])
+      7'b0100011,
+      7'b0100111: begin
+        case (inst32[14:12])
+          3'b000: cx_trace_decode_store_bytes_vld = cx_trace_mask_for_width(raw_addr, 4'd1);
+          3'b001: cx_trace_decode_store_bytes_vld = cx_trace_mask_for_width(raw_addr, 4'd2);
+          3'b010: cx_trace_decode_store_bytes_vld = cx_trace_mask_for_width(raw_addr, 4'd4);
+          3'b011: cx_trace_decode_store_bytes_vld = cx_trace_mask_for_width(raw_addr, 4'd8);
+          default: cx_trace_decode_store_bytes_vld = fallback_bytes_vld;
+        endcase
+      end
+      7'b0101111: begin
+        case (inst32[14:12])
+          3'b010: cx_trace_decode_store_bytes_vld = cx_trace_mask_for_width(raw_addr, 4'd4);
+          3'b011: cx_trace_decode_store_bytes_vld = cx_trace_mask_for_width(raw_addr, 4'd8);
+          default: cx_trace_decode_store_bytes_vld = fallback_bytes_vld;
+        endcase
+      end
+      default: cx_trace_decode_store_bytes_vld = fallback_bytes_vld;
+    endcase
+  end
+endfunction
 
 function [15:0] cx_trace_expand_store_bytes_vld;
   input [39:0] raw_addr;
@@ -278,22 +389,98 @@ function [63:0] cx_trace_pack_store_data;
   end
 endfunction
 
+function [127:0] cx_trace_expand_store_data128;
+  input [39:0] raw_addr;
+  input [7:0] raw_bytes_vld;
+  input [63:0] lane_data;
+  integer src;
+  integer dst;
+  reg [127:0] expanded_data;
+  reg [127:0] byte_value;
+  reg [127:0] lane_data_ext;
+  begin
+    expanded_data = 128'b0;
+    lane_data_ext = {64'b0, lane_data};
+    for (src = 0; src < 8; src = src + 1) begin
+      if (raw_bytes_vld[src]) begin
+        dst = raw_addr[3] ? (src + 8) : src;
+        byte_value = (lane_data_ext >> (src * 8)) & 128'hff;
+        expanded_data = expanded_data | (byte_value << (dst * 8));
+      end
+    end
+    cx_trace_expand_store_data128 = expanded_data;
+  end
+endfunction
+
 task cx_trace_store_raw8;
   input [31:0] raw_cycle;
   input [39:0] raw_addr;
   input [7:0] raw_bytes_vld;
   input [63:0] lane_data;
+  reg [7:0] trace_bytes_vld;
   begin
     if(raw_bytes_vld != 8'b0 &&
        raw_addr[31:0] >= 32'h00040000 &&
        raw_addr[31:0] < 32'h00100000) begin
+      if(cx_trace_last_commit_vld && raw_cycle == cx_trace_last_commit_cycle) begin
+        trace_bytes_vld = cx_trace_decode_store_bytes_vld(cx_trace_last_commit_pc,
+                                                          raw_addr,
+                                                          raw_bytes_vld);
+        $fwrite(cx_trace_file,
+                "store cycle=%0d hart=0 pc=0x%010x addr=0x%010x mask=0x%04x data=0x%032x\n",
+                raw_cycle,
+                cx_trace_last_commit_pc,
+                raw_addr,
+                cx_trace_expand_store_bytes_vld(raw_addr, trace_bytes_vld),
+                cx_trace_expand_store_data128(raw_addr, trace_bytes_vld, lane_data));
+      end
+      else if(`tb_retire0) begin
+        trace_bytes_vld = cx_trace_decode_store_bytes_vld(`retire0_pc,
+                                                          raw_addr,
+                                                          raw_bytes_vld);
+        $fwrite(cx_trace_file,
+                "store cycle=%0d hart=0 pc=0x%010x addr=0x%010x mask=0x%04x data=0x%032x\n",
+                raw_cycle,
+                `retire0_pc,
+                raw_addr,
+                cx_trace_expand_store_bytes_vld(raw_addr, trace_bytes_vld),
+                cx_trace_expand_store_data128(raw_addr, trace_bytes_vld, lane_data));
+      end
+      else begin
+        $fwrite(cx_trace_file,
+                "store_raw cycle=%0d hart=0 raw_addr=0x%010x raw_bytes_vld=0x%04x raw_data=0x%016x addr_cycle=%0d\n",
+                raw_cycle,
+                raw_addr,
+                cx_trace_expand_store_bytes_vld(raw_addr, raw_bytes_vld),
+                cx_trace_pack_store_data(lane_data, raw_bytes_vld),
+                raw_cycle);
+      end
+    end
+  end
+endtask
+
+task cx_trace_store_with_pc8;
+  input [31:0] raw_cycle;
+  input [39:0] raw_pc;
+  input [39:0] raw_addr;
+  input [7:0] raw_bytes_vld;
+  input [63:0] lane_data;
+  reg [7:0] trace_bytes_vld;
+  begin
+    if(raw_pc != 40'b0 &&
+       raw_bytes_vld != 8'b0 &&
+       raw_addr[31:0] >= 32'h00040000 &&
+       raw_addr[31:0] < 32'h00100000) begin
+      trace_bytes_vld = cx_trace_decode_store_bytes_vld(raw_pc,
+                                                        raw_addr,
+                                                        raw_bytes_vld);
       $fwrite(cx_trace_file,
-              "store_raw cycle=%0d hart=0 raw_addr=0x%010x raw_bytes_vld=0x%04x raw_data=0x%016x addr_cycle=%0d\n",
+              "store cycle=%0d hart=0 pc=0x%010x addr=0x%010x mask=0x%04x data=0x%032x\n",
               raw_cycle,
+              raw_pc,
               raw_addr,
-              cx_trace_expand_store_bytes_vld(raw_addr, raw_bytes_vld),
-              cx_trace_pack_store_data(lane_data, raw_bytes_vld),
-              raw_cycle);
+              cx_trace_expand_store_bytes_vld(raw_addr, trace_bytes_vld),
+              cx_trace_expand_store_data128(raw_addr, trace_bytes_vld, lane_data));
     end
   end
 endtask
@@ -305,12 +492,142 @@ begin
   end
   cx_trace_file = $fopen(cx_trace_path, "w");
   cx_trace_started = 1'b0;
+  cx_trace_last_commit_cycle = 32'b0;
+  cx_trace_last_commit_pc = 40'b0;
+  cx_trace_last_commit_vld = 1'b0;
+  for (cx_trace_slot = 0; cx_trace_slot < 4; cx_trace_slot = cx_trace_slot + 1) begin
+    cx_trace_amo_pc[cx_trace_slot] = 40'b0;
+    cx_trace_amo_pc_vld[cx_trace_slot] = 1'b0;
+    cx_trace_store_pc[cx_trace_slot] = 40'b0;
+    cx_trace_store_pc_vld[cx_trace_slot] = 1'b0;
+    cx_trace_store_bytes_vld[cx_trace_slot] = 8'b0;
+    cx_trace_store_size[cx_trace_slot] = 2'b0;
+  end
+end
+
+always @(posedge clk or negedge rst_b)
+begin
+  if(!rst_b) begin
+    for (cx_trace_slot = 0; cx_trace_slot < 4; cx_trace_slot = cx_trace_slot + 1) begin
+      cx_trace_amo_pc[cx_trace_slot] <= 40'b0;
+      cx_trace_amo_pc_vld[cx_trace_slot] <= 1'b0;
+      cx_trace_store_pc[cx_trace_slot] <= 40'b0;
+      cx_trace_store_pc_vld[cx_trace_slot] <= 1'b0;
+      cx_trace_store_bytes_vld[cx_trace_slot] <= 8'b0;
+      cx_trace_store_size[cx_trace_slot] <= 2'b0;
+    end
+  end
+  else begin
+    if(`LSU_STB.stb_create_en_gate[0] &&
+       !`LSU_STB.stb_create_dca_inst &&
+       !`LSU_STB.stb_create_amo_inst &&
+       `LSU_STB.stb_create_src2_depd) begin
+      cx_trace_store_pc[0] <= cx_trace_store_create_pc();
+      cx_trace_store_pc_vld[0] <= 1'b1;
+      cx_trace_store_bytes_vld[0] <= `LSU_STB.stb_create_bytes_vld[7:0];
+      cx_trace_store_size[0] <= `LSU_TOP.ag_dc_func[3:2];
+    end
+    if(`LSU_STB.stb_create_en_gate[1] &&
+       !`LSU_STB.stb_create_dca_inst &&
+       !`LSU_STB.stb_create_amo_inst &&
+       `LSU_STB.stb_create_src2_depd) begin
+      cx_trace_store_pc[1] <= cx_trace_store_create_pc();
+      cx_trace_store_pc_vld[1] <= 1'b1;
+      cx_trace_store_bytes_vld[1] <= `LSU_STB.stb_create_bytes_vld[7:0];
+      cx_trace_store_size[1] <= `LSU_TOP.ag_dc_func[3:2];
+    end
+    if(`LSU_STB.stb_create_en_gate[2] &&
+       !`LSU_STB.stb_create_dca_inst &&
+       !`LSU_STB.stb_create_amo_inst &&
+       `LSU_STB.stb_create_src2_depd) begin
+      cx_trace_store_pc[2] <= cx_trace_store_create_pc();
+      cx_trace_store_pc_vld[2] <= 1'b1;
+      cx_trace_store_bytes_vld[2] <= `LSU_STB.stb_create_bytes_vld[7:0];
+      cx_trace_store_size[2] <= `LSU_TOP.ag_dc_func[3:2];
+    end
+    if(`LSU_STB.stb_create_en_gate[3] &&
+       !`LSU_STB.stb_create_dca_inst &&
+       !`LSU_STB.stb_create_amo_inst &&
+       `LSU_STB.stb_create_src2_depd) begin
+      cx_trace_store_pc[3] <= cx_trace_store_create_pc();
+      cx_trace_store_pc_vld[3] <= 1'b1;
+      cx_trace_store_bytes_vld[3] <= `LSU_STB.stb_create_bytes_vld[7:0];
+      cx_trace_store_size[3] <= `LSU_TOP.ag_dc_func[3:2];
+    end
+    if(`LSU_STB.stb_create_en_gate[0] && `LSU_STB.stb_create_amo_inst) begin
+      cx_trace_amo_pc[0] <= {24'b0, `LSU_TOP.ag_dc_inst_pc[15:0]};
+      cx_trace_amo_pc_vld[0] <= 1'b1;
+    end
+    if(`LSU_STB.stb_create_en_gate[1] && `LSU_STB.stb_create_amo_inst) begin
+      cx_trace_amo_pc[1] <= {24'b0, `LSU_TOP.ag_dc_inst_pc[15:0]};
+      cx_trace_amo_pc_vld[1] <= 1'b1;
+    end
+    if(`LSU_STB.stb_create_en_gate[2] && `LSU_STB.stb_create_amo_inst) begin
+      cx_trace_amo_pc[2] <= {24'b0, `LSU_TOP.ag_dc_inst_pc[15:0]};
+      cx_trace_amo_pc_vld[2] <= 1'b1;
+    end
+    if(`LSU_STB.stb_create_en_gate[3] && `LSU_STB.stb_create_amo_inst) begin
+      cx_trace_amo_pc[3] <= {24'b0, `LSU_TOP.ag_dc_inst_pc[15:0]};
+      cx_trace_amo_pc_vld[3] <= 1'b1;
+    end
+    if(`LSU_STB.x_aq_lsu_stb_entry_0.stb_entry_amo_inst &&
+       (`LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_vld ||
+        `LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_vld)) begin
+      cx_trace_amo_pc_vld[0] <= 1'b0;
+    end
+    if(!`LSU_STB.x_aq_lsu_stb_entry_0.stb_entry_amo_inst &&
+       (`LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_vld ||
+        `LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_vld)) begin
+      cx_trace_store_pc_vld[0] <= 1'b0;
+      cx_trace_store_bytes_vld[0] <= 8'b0;
+      cx_trace_store_size[0] <= 2'b0;
+    end
+    if(`LSU_STB.x_aq_lsu_stb_entry_1.stb_entry_amo_inst &&
+       (`LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_vld ||
+        `LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_vld)) begin
+      cx_trace_amo_pc_vld[1] <= 1'b0;
+    end
+    if(!`LSU_STB.x_aq_lsu_stb_entry_1.stb_entry_amo_inst &&
+       (`LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_vld ||
+        `LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_vld)) begin
+      cx_trace_store_pc_vld[1] <= 1'b0;
+      cx_trace_store_bytes_vld[1] <= 8'b0;
+      cx_trace_store_size[1] <= 2'b0;
+    end
+    if(`LSU_STB.x_aq_lsu_stb_entry_2.stb_entry_amo_inst &&
+       (`LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_vld ||
+        `LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_vld)) begin
+      cx_trace_amo_pc_vld[2] <= 1'b0;
+    end
+    if(!`LSU_STB.x_aq_lsu_stb_entry_2.stb_entry_amo_inst &&
+       (`LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_vld ||
+        `LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_vld)) begin
+      cx_trace_store_pc_vld[2] <= 1'b0;
+      cx_trace_store_bytes_vld[2] <= 8'b0;
+      cx_trace_store_size[2] <= 2'b0;
+    end
+    if(`LSU_STB.x_aq_lsu_stb_entry_3.stb_entry_amo_inst &&
+       (`LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_vld ||
+        `LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_vld)) begin
+      cx_trace_amo_pc_vld[3] <= 1'b0;
+    end
+    if(!`LSU_STB.x_aq_lsu_stb_entry_3.stb_entry_amo_inst &&
+       (`LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_vld ||
+        `LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_vld)) begin
+      cx_trace_store_pc_vld[3] <= 1'b0;
+      cx_trace_store_bytes_vld[3] <= 8'b0;
+      cx_trace_store_size[3] <= 2'b0;
+    end
+  end
 end
 
 always @(posedge clk)
 begin
   if(cx_trace_file != 0) begin
     if(`tb_retire0) begin
+      cx_trace_last_commit_cycle = cycle_count[31:0];
+      cx_trace_last_commit_pc = `retire0_pc;
+      cx_trace_last_commit_vld = 1'b1;
       $fwrite(cx_trace_file, "commit cycle=%0d hart=0 pc=0x%010x", cycle_count[31:0], `retire0_pc);
       if(`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_dp.dp_retire_ex2_inst_expt) begin
         $fwrite(cx_trace_file, " exc_cause=%0d", `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_dp.dp_retire_ex2_vec[4:0]);
@@ -341,83 +658,371 @@ begin
       end
       if(`LSU_STB.stb_create_en_gate[0] &&
          !`LSU_STB.stb_create_dca_inst &&
+         !`LSU_STB.stb_create_amo_inst &&
          !`LSU_STB.stb_create_src2_depd) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_create_pa[39:0],
-                            `LSU_STB.stb_create_bytes_vld[7:0],
-                            `LSU_STB.stb_create_data[63:0]);
+        cx_trace_store_with_pc8(cycle_count[31:0],
+                                cx_trace_store_create_pc(),
+                                `LSU_STB.stb_create_pa[39:0],
+                                `LSU_STB.stb_create_bytes_vld[7:0],
+                                `LSU_STB.stb_create_data[63:0]);
       end
       if(`LSU_STB.stb_create_en_gate[1] &&
          !`LSU_STB.stb_create_dca_inst &&
+         !`LSU_STB.stb_create_amo_inst &&
          !`LSU_STB.stb_create_src2_depd) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_create_pa[39:0],
-                            `LSU_STB.stb_create_bytes_vld[7:0],
-                            `LSU_STB.stb_create_data[63:0]);
+        cx_trace_store_with_pc8(cycle_count[31:0],
+                                cx_trace_store_create_pc(),
+                                `LSU_STB.stb_create_pa[39:0],
+                                `LSU_STB.stb_create_bytes_vld[7:0],
+                                `LSU_STB.stb_create_data[63:0]);
       end
       if(`LSU_STB.stb_create_en_gate[2] &&
          !`LSU_STB.stb_create_dca_inst &&
+         !`LSU_STB.stb_create_amo_inst &&
          !`LSU_STB.stb_create_src2_depd) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_create_pa[39:0],
-                            `LSU_STB.stb_create_bytes_vld[7:0],
-                            `LSU_STB.stb_create_data[63:0]);
+        cx_trace_store_with_pc8(cycle_count[31:0],
+                                cx_trace_store_create_pc(),
+                                `LSU_STB.stb_create_pa[39:0],
+                                `LSU_STB.stb_create_bytes_vld[7:0],
+                                `LSU_STB.stb_create_data[63:0]);
       end
       if(`LSU_STB.stb_create_en_gate[3] &&
          !`LSU_STB.stb_create_dca_inst &&
+         !`LSU_STB.stb_create_amo_inst &&
          !`LSU_STB.stb_create_src2_depd) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_create_pa[39:0],
-                            `LSU_STB.stb_create_bytes_vld[7:0],
-                            `LSU_STB.stb_create_data[63:0]);
+        cx_trace_store_with_pc8(cycle_count[31:0],
+                                cx_trace_store_create_pc(),
+                                `LSU_STB.stb_create_pa[39:0],
+                                `LSU_STB.stb_create_bytes_vld[7:0],
+                                `LSU_STB.stb_create_data[63:0]);
       end
       if(`LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_vld) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_entry0_pa[39:0],
-                            `LSU_STB.stb_entry0_bytes_vld[7:0],
-                            `LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_data[63:0]);
+        if(`LSU_STB.x_aq_lsu_stb_entry_0.stb_entry_amo_inst &&
+           cx_trace_amo_pc_vld[0]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_amo_pc[0],
+                                  `LSU_STB.stb_entry0_pa[39:0],
+                                  `LSU_STB.stb_entry0_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_data[63:0]);
+        end
+        else if(`LSU_STB.stb_create_en_gate[0] &&
+                !`LSU_STB.stb_create_dca_inst &&
+                !`LSU_STB.stb_create_amo_inst) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_create_pc(),
+                                  `LSU_STB.stb_entry0_pa[39:0],
+                                  `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_data[63:0]);
+        end
+        else if(cx_trace_store_pc_vld[0]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_pc[0],
+                                  `LSU_STB.stb_entry0_pa[39:0],
+                                  cx_trace_store_bytes_vld[0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_data[63:0]);
+        end
+        else if(!`LSU_STB.x_aq_lsu_stb_entry_0.stb_entry_amo_inst) begin
+          if(`tb_retire0) begin
+            cx_trace_store_with_pc8(cycle_count[31:0],
+                                    `retire0_pc,
+                                    `LSU_STB.stb_entry0_pa[39:0],
+                                    `LSU_STB.stb_entry0_bytes_vld[7:0],
+                                    `LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_data[63:0]);
+          end
+          else begin
+            cx_trace_store_raw8(cycle_count[31:0],
+                                `LSU_STB.stb_entry0_pa[39:0],
+                                `LSU_STB.stb_entry0_bytes_vld[7:0],
+                                `LSU_STB.x_aq_lsu_stb_entry_0.stb_fwd_data[63:0]);
+          end
+        end
       end
       if(`LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_vld) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_entry1_pa[39:0],
-                            `LSU_STB.stb_entry1_bytes_vld[7:0],
-                            `LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_data[63:0]);
+        if(`LSU_STB.x_aq_lsu_stb_entry_1.stb_entry_amo_inst &&
+           cx_trace_amo_pc_vld[1]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_amo_pc[1],
+                                  `LSU_STB.stb_entry1_pa[39:0],
+                                  `LSU_STB.stb_entry1_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_data[63:0]);
+        end
+        else if(`LSU_STB.stb_create_en_gate[1] &&
+                !`LSU_STB.stb_create_dca_inst &&
+                !`LSU_STB.stb_create_amo_inst) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_create_pc(),
+                                  `LSU_STB.stb_entry1_pa[39:0],
+                                  `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_data[63:0]);
+        end
+        else if(cx_trace_store_pc_vld[1]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_pc[1],
+                                  `LSU_STB.stb_entry1_pa[39:0],
+                                  cx_trace_store_bytes_vld[1],
+                                  `LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_data[63:0]);
+        end
+        else if(!`LSU_STB.x_aq_lsu_stb_entry_1.stb_entry_amo_inst) begin
+          if(`tb_retire0) begin
+            cx_trace_store_with_pc8(cycle_count[31:0],
+                                    `retire0_pc,
+                                    `LSU_STB.stb_entry1_pa[39:0],
+                                    `LSU_STB.stb_entry1_bytes_vld[7:0],
+                                    `LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_data[63:0]);
+          end
+          else begin
+            cx_trace_store_raw8(cycle_count[31:0],
+                                `LSU_STB.stb_entry1_pa[39:0],
+                                `LSU_STB.stb_entry1_bytes_vld[7:0],
+                                `LSU_STB.x_aq_lsu_stb_entry_1.stb_fwd_data[63:0]);
+          end
+        end
       end
       if(`LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_vld) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_entry2_pa[39:0],
-                            `LSU_STB.stb_entry2_bytes_vld[7:0],
-                            `LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_data[63:0]);
+        if(`LSU_STB.x_aq_lsu_stb_entry_2.stb_entry_amo_inst &&
+           cx_trace_amo_pc_vld[2]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_amo_pc[2],
+                                  `LSU_STB.stb_entry2_pa[39:0],
+                                  `LSU_STB.stb_entry2_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_data[63:0]);
+        end
+        else if(`LSU_STB.stb_create_en_gate[2] &&
+                !`LSU_STB.stb_create_dca_inst &&
+                !`LSU_STB.stb_create_amo_inst) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_create_pc(),
+                                  `LSU_STB.stb_entry2_pa[39:0],
+                                  `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_data[63:0]);
+        end
+        else if(cx_trace_store_pc_vld[2]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_pc[2],
+                                  `LSU_STB.stb_entry2_pa[39:0],
+                                  cx_trace_store_bytes_vld[2],
+                                  `LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_data[63:0]);
+        end
+        else if(!`LSU_STB.x_aq_lsu_stb_entry_2.stb_entry_amo_inst) begin
+          if(`tb_retire0) begin
+            cx_trace_store_with_pc8(cycle_count[31:0],
+                                    `retire0_pc,
+                                    `LSU_STB.stb_entry2_pa[39:0],
+                                    `LSU_STB.stb_entry2_bytes_vld[7:0],
+                                    `LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_data[63:0]);
+          end
+          else begin
+            cx_trace_store_raw8(cycle_count[31:0],
+                                `LSU_STB.stb_entry2_pa[39:0],
+                                `LSU_STB.stb_entry2_bytes_vld[7:0],
+                                `LSU_STB.x_aq_lsu_stb_entry_2.stb_fwd_data[63:0]);
+          end
+        end
       end
       if(`LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_vld) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_entry3_pa[39:0],
-                            `LSU_STB.stb_entry3_bytes_vld[7:0],
-                            `LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_data[63:0]);
+        if(`LSU_STB.x_aq_lsu_stb_entry_3.stb_entry_amo_inst &&
+           cx_trace_amo_pc_vld[3]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_amo_pc[3],
+                                  `LSU_STB.stb_entry3_pa[39:0],
+                                  `LSU_STB.stb_entry3_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_data[63:0]);
+        end
+        else if(`LSU_STB.stb_create_en_gate[3] &&
+                !`LSU_STB.stb_create_dca_inst &&
+                !`LSU_STB.stb_create_amo_inst) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_create_pc(),
+                                  `LSU_STB.stb_entry3_pa[39:0],
+                                  `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_data[63:0]);
+        end
+        else if(cx_trace_store_pc_vld[3]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_pc[3],
+                                  `LSU_STB.stb_entry3_pa[39:0],
+                                  cx_trace_store_bytes_vld[3],
+                                  `LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_data[63:0]);
+        end
+        else if(!`LSU_STB.x_aq_lsu_stb_entry_3.stb_entry_amo_inst) begin
+          if(`tb_retire0) begin
+            cx_trace_store_with_pc8(cycle_count[31:0],
+                                    `retire0_pc,
+                                    `LSU_STB.stb_entry3_pa[39:0],
+                                    `LSU_STB.stb_entry3_bytes_vld[7:0],
+                                    `LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_data[63:0]);
+          end
+          else begin
+            cx_trace_store_raw8(cycle_count[31:0],
+                                `LSU_STB.stb_entry3_pa[39:0],
+                                `LSU_STB.stb_entry3_bytes_vld[7:0],
+                                `LSU_STB.x_aq_lsu_stb_entry_3.stb_fwd_data[63:0]);
+          end
+        end
       end
       if(`LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_vld) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_entry0_pa[39:0],
-                            `LSU_STB.stb_entry0_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
-                            `LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_data[63:0]);
+        if(`LSU_STB.x_aq_lsu_stb_entry_0.stb_entry_amo_inst &&
+           cx_trace_amo_pc_vld[0]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_amo_pc[0],
+                                  `LSU_STB.stb_entry0_pa[39:0],
+                                  `LSU_STB.stb_entry0_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_data[63:0]);
+        end
+        else if(`LSU_STB.stb_create_en_gate[0] &&
+                !`LSU_STB.stb_create_dca_inst &&
+                !`LSU_STB.stb_create_amo_inst) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_create_pc(),
+                                  `LSU_STB.stb_entry0_pa[39:0],
+                                  `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_data[63:0]);
+        end
+        else if(cx_trace_store_pc_vld[0]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_pc[0],
+                                  `LSU_STB.stb_entry0_pa[39:0],
+                                  cx_trace_store_bytes_vld[0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_data[63:0]);
+        end
+        else begin
+          if(`tb_retire0) begin
+            cx_trace_store_with_pc8(cycle_count[31:0],
+                                    `retire0_pc,
+                                    `LSU_STB.stb_entry0_pa[39:0],
+                                    `LSU_STB.stb_entry0_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                    `LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_data[63:0]);
+          end
+          else begin
+            cx_trace_store_raw8(cycle_count[31:0],
+                                `LSU_STB.stb_entry0_pa[39:0],
+                                `LSU_STB.stb_entry0_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                `LSU_STB.x_aq_lsu_stb_entry_0.stb_merge_data[63:0]);
+          end
+        end
       end
       if(`LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_vld) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_entry1_pa[39:0],
-                            `LSU_STB.stb_entry1_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
-                            `LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_data[63:0]);
+        if(`LSU_STB.x_aq_lsu_stb_entry_1.stb_entry_amo_inst &&
+           cx_trace_amo_pc_vld[1]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_amo_pc[1],
+                                  `LSU_STB.stb_entry1_pa[39:0],
+                                  `LSU_STB.stb_entry1_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_data[63:0]);
+        end
+        else if(`LSU_STB.stb_create_en_gate[1] &&
+                !`LSU_STB.stb_create_dca_inst &&
+                !`LSU_STB.stb_create_amo_inst) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_create_pc(),
+                                  `LSU_STB.stb_entry1_pa[39:0],
+                                  `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_data[63:0]);
+        end
+        else if(cx_trace_store_pc_vld[1]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_pc[1],
+                                  `LSU_STB.stb_entry1_pa[39:0],
+                                  cx_trace_store_bytes_vld[1],
+                                  `LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_data[63:0]);
+        end
+        else begin
+          if(`tb_retire0) begin
+            cx_trace_store_with_pc8(cycle_count[31:0],
+                                    `retire0_pc,
+                                    `LSU_STB.stb_entry1_pa[39:0],
+                                    `LSU_STB.stb_entry1_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                    `LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_data[63:0]);
+          end
+          else begin
+            cx_trace_store_raw8(cycle_count[31:0],
+                                `LSU_STB.stb_entry1_pa[39:0],
+                                `LSU_STB.stb_entry1_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                `LSU_STB.x_aq_lsu_stb_entry_1.stb_merge_data[63:0]);
+          end
+        end
       end
       if(`LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_vld) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_entry2_pa[39:0],
-                            `LSU_STB.stb_entry2_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
-                            `LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_data[63:0]);
+        if(`LSU_STB.x_aq_lsu_stb_entry_2.stb_entry_amo_inst &&
+           cx_trace_amo_pc_vld[2]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_amo_pc[2],
+                                  `LSU_STB.stb_entry2_pa[39:0],
+                                  `LSU_STB.stb_entry2_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_data[63:0]);
+        end
+        else if(`LSU_STB.stb_create_en_gate[2] &&
+                !`LSU_STB.stb_create_dca_inst &&
+                !`LSU_STB.stb_create_amo_inst) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_create_pc(),
+                                  `LSU_STB.stb_entry2_pa[39:0],
+                                  `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_data[63:0]);
+        end
+        else if(cx_trace_store_pc_vld[2]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_pc[2],
+                                  `LSU_STB.stb_entry2_pa[39:0],
+                                  cx_trace_store_bytes_vld[2],
+                                  `LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_data[63:0]);
+        end
+        else begin
+          if(`tb_retire0) begin
+            cx_trace_store_with_pc8(cycle_count[31:0],
+                                    `retire0_pc,
+                                    `LSU_STB.stb_entry2_pa[39:0],
+                                    `LSU_STB.stb_entry2_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                    `LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_data[63:0]);
+          end
+          else begin
+            cx_trace_store_raw8(cycle_count[31:0],
+                                `LSU_STB.stb_entry2_pa[39:0],
+                                `LSU_STB.stb_entry2_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                `LSU_STB.x_aq_lsu_stb_entry_2.stb_merge_data[63:0]);
+          end
+        end
       end
       if(`LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_vld) begin
-        cx_trace_store_raw8(cycle_count[31:0],
-                            `LSU_STB.stb_entry3_pa[39:0],
-                            `LSU_STB.stb_entry3_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
-                            `LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_data[63:0]);
+        if(`LSU_STB.x_aq_lsu_stb_entry_3.stb_entry_amo_inst &&
+           cx_trace_amo_pc_vld[3]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_amo_pc[3],
+                                  `LSU_STB.stb_entry3_pa[39:0],
+                                  `LSU_STB.stb_entry3_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_data[63:0]);
+        end
+        else if(`LSU_STB.stb_create_en_gate[3] &&
+                !`LSU_STB.stb_create_dca_inst &&
+                !`LSU_STB.stb_create_amo_inst) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_create_pc(),
+                                  `LSU_STB.stb_entry3_pa[39:0],
+                                  `LSU_STB.stb_create_bytes_vld[7:0],
+                                  `LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_data[63:0]);
+        end
+        else if(cx_trace_store_pc_vld[3]) begin
+          cx_trace_store_with_pc8(cycle_count[31:0],
+                                  cx_trace_store_pc[3],
+                                  `LSU_STB.stb_entry3_pa[39:0],
+                                  cx_trace_store_bytes_vld[3],
+                                  `LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_data[63:0]);
+        end
+        else begin
+          if(`tb_retire0) begin
+            cx_trace_store_with_pc8(cycle_count[31:0],
+                                    `retire0_pc,
+                                    `LSU_STB.stb_entry3_pa[39:0],
+                                    `LSU_STB.stb_entry3_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                    `LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_data[63:0]);
+          end
+          else begin
+            cx_trace_store_raw8(cycle_count[31:0],
+                                `LSU_STB.stb_entry3_pa[39:0],
+                                `LSU_STB.stb_entry3_bytes_vld[7:0] | `LSU_STB.stb_create_bytes_vld[7:0],
+                                `LSU_STB.x_aq_lsu_stb_entry_3.stb_merge_data[63:0]);
+          end
+        end
       end
     end
     if(`tb_retire0 || cpu_wvalid ||

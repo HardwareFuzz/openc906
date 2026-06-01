@@ -2644,5 +2644,3 @@ assign dc_dbginfo[9:0] = {dc_cur_state[1:0],dc_src2_depd, dc_ptw, dc_func[3:0], 
 
 // &ModuleEnd; @1900
 endmodule
-
-
