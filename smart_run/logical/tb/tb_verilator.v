@@ -41,6 +41,10 @@ limitations under the License.
 `define CPU_RST             `CPU_TOP.pad_cpu_rst_b
 `define LSU_TOP             `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_lsu_top
 `define LSU_STB             `LSU_TOP.x_aq_lsu_stb
+`define IDU_TOP             `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_idu_top
+`define RTU_TOP             `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top
+`define RTU_RETIRE          `RTU_TOP.x_aq_rtu_retire
+`define CP0_TOP             `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_cp0_top
 
 
 
@@ -256,6 +260,54 @@ reg        cx_trace_store_pc_vld [0:3];
 reg [7:0]  cx_trace_store_bytes_vld [0:3];
 reg [1:0]  cx_trace_store_size [0:3];
 integer    cx_trace_slot;
+
+// CX Trace V2 tracks architectural instructions independently from the
+// legacy PC-keyed side-effect trace below.  OpenC906 is in order, but some
+// architectural instructions are dispatched and retired as multiple split
+// uops.  The FIFO therefore allocates only on the first accepted uop and pops
+// only on the architectural terminal edge.
+localparam CX_V2_FIFO_DEPTH = 256;
+reg [63:0] cx_v2_token_q       [0:CX_V2_FIFO_DEPTH-1];
+reg [63:0] cx_v2_start_q       [0:CX_V2_FIFO_DEPTH-1];
+reg [31:0] cx_v2_insn_q        [0:CX_V2_FIFO_DEPTH-1];
+reg [1:0]  cx_v2_priv_q        [0:CX_V2_FIFO_DEPTH-1];
+reg [2:0]  cx_v2_insn_len_q    [0:CX_V2_FIFO_DEPTH-1];
+reg        cx_v2_valid_q       [0:CX_V2_FIFO_DEPTH-1];
+reg [7:0]  cx_v2_head;
+reg [7:0]  cx_v2_tail;
+reg [8:0]  cx_v2_count;
+reg [63:0] cx_v2_cycle;
+reg [63:0] cx_v2_next_token;
+reg [63:0] cx_v2_term_seq;
+reg [63:0] cx_v2_instret_seq;
+reg        cx_v2_split_active;
+integer    cx_v2_slot;
+
+wire cx_v2_dispatch_accept =
+  `IDU_TOP.x_aq_idu_id_ctrl.ctrl_pipedown_inst_vld;
+// IDU_SPLIT is bit 198 in aq_idu_cfig.h.  It is one on every non-final
+// split uop and zero on a normal instruction or the final split uop.
+wire cx_v2_dispatch_split =
+  `IDU_TOP.x_aq_idu_id_dp.dp_id_inst_data[198];
+wire cx_v2_allocate = cx_v2_dispatch_accept && !cx_v2_split_active;
+wire cx_v2_retire_vld = `RTU_RETIRE.retire_ex2_retire_vld;
+wire cx_v2_retire_split = `RTU_TOP.x_aq_rtu_dp.dp_retire_ex2_inst_split;
+wire cx_v2_sync_trap = cx_v2_retire_vld
+                       && `RTU_RETIRE.retire_trap_vld
+                       && !`RTU_RETIRE.retire_trap_int
+                       && `RTU_RETIRE.retire_sync_expt;
+wire cx_v2_arch_commit = cx_v2_retire_vld
+                         && !cx_v2_retire_split
+                         && !cx_v2_sync_trap;
+wire cx_v2_terminal = cx_v2_sync_trap || cx_v2_arch_commit;
+wire cx_v2_interrupt = cx_v2_retire_vld
+                       && `RTU_RETIRE.retire_trap_vld
+                       && `RTU_RETIRE.retire_trap_int;
+wire cx_v2_async_trap = cx_v2_retire_vld
+                        && `RTU_RETIRE.retire_trap_vld
+                        && !`RTU_RETIRE.retire_trap_int
+                        && `RTU_RETIRE.retire_async_expt;
+wire cx_v2_flush = `RTU_RETIRE.rtu_yy_xx_flush;
 
 function [39:0] cx_trace_store_create_pc;
   begin
@@ -491,6 +543,11 @@ begin
     cx_trace_path = "openc906_trace_hart_00000000.log";
   end
   cx_trace_file = $fopen(cx_trace_path, "w");
+  if(cx_trace_file == 0) begin
+    $fatal(1, "CX Trace V2 could not open trace file");
+  end
+  $fwrite(cx_trace_file,
+          "CXTRACE_HEADER v=2 trace_version=2 core=openc906 harts=1 cycle_domain=core_ref_clk cycle_base=first_post_reset_posedge_is_1 interval=inclusive start_kind=backend_alloc end_kind=arch_commit_or_precise_trap isa=rv64fd build_config=openc906_smart_run_verilator\n");
   cx_trace_started = 1'b0;
   cx_trace_last_commit_cycle = 32'b0;
   cx_trace_last_commit_pc = 40'b0;
@@ -502,6 +559,143 @@ begin
     cx_trace_store_pc_vld[cx_trace_slot] = 1'b0;
     cx_trace_store_bytes_vld[cx_trace_slot] = 8'b0;
     cx_trace_store_size[cx_trace_slot] = 2'b0;
+  end
+end
+
+always @(posedge clk or negedge `CPU_RST)
+begin
+  if(!`CPU_RST) begin
+    // With nonblocking observation, the first clk edge after reset release
+    // sees cycle one and then advances the counter for the following edge.
+    cx_v2_cycle        <= 64'd1;
+    cx_v2_head         <= 8'b0;
+    cx_v2_tail         <= 8'b0;
+    cx_v2_count        <= 9'b0;
+    cx_v2_next_token   <= 64'b0;
+    cx_v2_term_seq     <= 64'b0;
+    cx_v2_instret_seq  <= 64'b0;
+    cx_v2_split_active <= 1'b0;
+    for (cx_v2_slot = 0; cx_v2_slot < CX_V2_FIFO_DEPTH;
+         cx_v2_slot = cx_v2_slot + 1) begin
+      cx_v2_valid_q[cx_v2_slot] <= 1'b0;
+    end
+  end
+  else begin
+    cx_v2_cycle <= cx_v2_cycle + 64'd1;
+
+    if(cx_v2_dispatch_accept) begin
+      cx_v2_split_active <= cx_v2_dispatch_split;
+    end
+
+    if(cx_v2_allocate) begin
+      if(cx_v2_count == CX_V2_FIFO_DEPTH) begin
+        $fatal(1, "CX Trace V2 allocation FIFO overflow at cycle %0d",
+               cx_v2_cycle);
+      end
+      cx_v2_token_q[cx_v2_tail]    <= cx_v2_next_token;
+      cx_v2_start_q[cx_v2_tail]    <= cx_v2_cycle;
+      cx_v2_insn_q[cx_v2_tail]     <= `IDU_TOP.ifu_idu_id_inst[31:0];
+      cx_v2_priv_q[cx_v2_tail]     <= `CP0_TOP.cp0_yy_priv_mode[1:0];
+      cx_v2_insn_len_q[cx_v2_tail] <=
+        (`IDU_TOP.ifu_idu_id_inst[1:0] == 2'b11) ? 3'd4 : 3'd2;
+      cx_v2_valid_q[cx_v2_tail]    <= 1'b1;
+      cx_v2_tail                   <= cx_v2_tail + 8'd1;
+      cx_v2_next_token             <= cx_v2_next_token + 64'd1;
+    end
+
+    if(cx_v2_terminal) begin
+      if(cx_v2_count == 0 || !cx_v2_valid_q[cx_v2_head]) begin
+        $fatal(1,
+               "CX Trace V2 terminal lacks allocation metadata at cycle %0d pc=0x%010x",
+               cx_v2_cycle, `retire0_pc);
+      end
+      if(cx_v2_start_q[cx_v2_head] < 64'd1
+         || cx_v2_cycle < cx_v2_start_q[cx_v2_head]) begin
+        $fatal(1,
+               "CX Trace V2 invalid interval token=%0d start=%0d end=%0d",
+               cx_v2_token_q[cx_v2_head], cx_v2_start_q[cx_v2_head],
+               cx_v2_cycle);
+      end
+
+      if(cx_v2_sync_trap) begin
+        $fwrite(cx_trace_file,
+                "CXTRACE v=2 event=inst_terminal core=openc906 hart=0 token=%0d term_seq=%0d instret_seq=- commit_slot=0 pc=0x%010x insn=0x%08x insn_len=%0d start_cycle=%0d end_cycle=%0d span=%0d start_valid=1 start_kind=backend_alloc end_kind=precise_trap retired=0 trap=1 cause=0x%0x priv=%0d\n",
+                cx_v2_token_q[cx_v2_head], cx_v2_term_seq,
+                `retire0_pc,
+                (cx_v2_insn_len_q[cx_v2_head] == 3'd2)
+                  ? {16'b0, cx_v2_insn_q[cx_v2_head][15:0]}
+                  : cx_v2_insn_q[cx_v2_head],
+                cx_v2_insn_len_q[cx_v2_head],
+                cx_v2_start_q[cx_v2_head], cx_v2_cycle,
+                cx_v2_cycle - cx_v2_start_q[cx_v2_head] + 64'd1,
+                `RTU_RETIRE.retire_trap_vec[4:0],
+                cx_v2_priv_q[cx_v2_head]);
+      end
+      else begin
+        $fwrite(cx_trace_file,
+                "CXTRACE v=2 event=inst_terminal core=openc906 hart=0 token=%0d term_seq=%0d instret_seq=%0d commit_slot=0 pc=0x%010x insn=0x%08x insn_len=%0d start_cycle=%0d end_cycle=%0d span=%0d start_valid=1 start_kind=backend_alloc end_kind=arch_commit retired=1 trap=0 cause=none priv=%0d\n",
+                cx_v2_token_q[cx_v2_head], cx_v2_term_seq,
+                cx_v2_instret_seq, `retire0_pc,
+                (cx_v2_insn_len_q[cx_v2_head] == 3'd2)
+                  ? {16'b0, cx_v2_insn_q[cx_v2_head][15:0]}
+                  : cx_v2_insn_q[cx_v2_head],
+                cx_v2_insn_len_q[cx_v2_head],
+                cx_v2_start_q[cx_v2_head], cx_v2_cycle,
+                cx_v2_cycle - cx_v2_start_q[cx_v2_head] + 64'd1,
+                cx_v2_priv_q[cx_v2_head]);
+        cx_v2_instret_seq <= cx_v2_instret_seq + 64'd1;
+      end
+
+      cx_v2_valid_q[cx_v2_head] <= 1'b0;
+      cx_v2_head                 <= cx_v2_head + 8'd1;
+      cx_v2_term_seq             <= cx_v2_term_seq + 64'd1;
+    end
+
+    // Interrupts are boundary events, not instruction identities.  On C906
+    // they coincide with a final non-split uop, so that instruction still
+    // produces the normal terminal above before the younger queue is flushed.
+    if(cx_v2_interrupt) begin
+      $fwrite(cx_trace_file,
+              "CXTRACE v=2 event=interrupt core=openc906 hart=0 cycle=%0d cause=0x%016x priv=%0d\n",
+              cx_v2_cycle,
+              64'h8000000000000000 | {59'b0, `RTU_RETIRE.retire_trap_vec[4:0]},
+              `CP0_TOP.cp0_yy_priv_mode[1:0]);
+    end
+
+    // C906 labels delayed LSU bus faults as asynchronous exceptions.  The
+    // instruction at the retire boundary still commits; record the trap only
+    // as an auxiliary event so it cannot be mistaken for that instruction's
+    // precise terminal.
+    if(cx_v2_async_trap) begin
+      $fwrite(cx_trace_file,
+              "CXTRACE v=2 event=async_trap core=openc906 hart=0 cycle=%0d cause=0x%0x priv=%0d\n",
+              cx_v2_cycle, `RTU_RETIRE.retire_trap_vec[4:0],
+              `CP0_TOP.cp0_yy_priv_mode[1:0]);
+    end
+
+    case ({cx_v2_allocate, cx_v2_terminal})
+      2'b10: cx_v2_count <= cx_v2_count + 9'd1;
+      2'b01: cx_v2_count <= cx_v2_count - 9'd1;
+      default: cx_v2_count <= cx_v2_count;
+    endcase
+
+    // Backend flush is asserted only after the in-order pipeline has drained:
+    // older instructions have produced terminals, while canceled younger
+    // entries remain in this shadow FIFO and must all be invalidated.
+    if(cx_v2_flush) begin
+      cx_v2_count        <= 9'b0;
+      cx_v2_head         <= cx_v2_allocate ? cx_v2_tail + 8'd1 : cx_v2_tail;
+      cx_v2_split_active <= 1'b0;
+      for (cx_v2_slot = 0; cx_v2_slot < CX_V2_FIFO_DEPTH;
+           cx_v2_slot = cx_v2_slot + 1) begin
+        cx_v2_valid_q[cx_v2_slot] <= 1'b0;
+      end
+    end
+
+    if(cx_v2_allocate || cx_v2_terminal || cx_v2_interrupt
+       || cx_v2_async_trap || cx_v2_flush) begin
+      $fflush(cx_trace_file);
+    end
   end
 end
 
