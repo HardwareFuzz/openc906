@@ -823,8 +823,17 @@ begin
       cx_trace_last_commit_pc = `retire0_pc;
       cx_trace_last_commit_vld = 1'b1;
       $fwrite(cx_trace_file, "commit cycle=%0d hart=0 pc=0x%010x", cycle_count[31:0], `retire0_pc);
-      if(`CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_dp.dp_retire_ex2_inst_expt) begin
-        $fwrite(cx_trace_file, " exc_cause=%0d", `CPU_TOP.x_aq_top_0.x_aq_core.x_aq_rtu_top.x_aq_rtu_dp.dp_retire_ex2_vec[4:0]);
+      // Retire-level architectural exception (sync): the EX2-instruction
+      // exceptions (illegal, ecall, page-fault, ...) AND the retired
+      // breakpoint (ebreak, mcause=3).  ebreak is generated at retire
+      // (retire_bkpt_expt) and is NOT visible in dp_retire_ex2_inst_expt,
+      // so the legacy EX2-only sample below missed it.  retire_trap_vec
+      // already priority-encodes the sync cause (pending bkpt=3, bkpt=3,
+      // else dp_retire_ex2_vec).  Mirrors cx_v2_sync_trap in this file.
+      if(`RTU_RETIRE.retire_trap_vld
+         && !`RTU_RETIRE.retire_trap_int
+         && `RTU_RETIRE.retire_sync_expt) begin
+        $fwrite(cx_trace_file, " exc_cause=%0d", `RTU_RETIRE.retire_trap_vec[4:0]);
       end
       $fwrite(cx_trace_file, "\n");
       cx_trace_started <= 1'b1;
