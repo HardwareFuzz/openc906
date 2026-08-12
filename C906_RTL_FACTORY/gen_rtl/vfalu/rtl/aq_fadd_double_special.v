@@ -335,24 +335,34 @@ assign ex2_special_sign_0[2:0] = {ex2_r_inf_sign_0_c,2'b0};
 // for max/min, has nan
 // src1, src0, qnan_src2,qnan_src1,qnan_src0,cnan,inf,zero,src2
 // &CombBeg; @145
+// FIX(upstream-inherent): RISC-V maxNum/minNum requires that when exactly
+// one operand is NaN (signaling or quiet) the result is the non-NaN operand;
+// only when BOTH operands are NaN may the result be a (quiet) NaN. The
+// original code returned a canonical QNaN for a single SNaN input. Now a
+// single NaN (SNaN or QNaN) selects the other operand; both-NaN still
+// selects cnan (dqnan=0) or a quieted operand (dqnan=1).
 always @( ex2_src0_snan
        or ex2_src1_snan
        or ex2_src0_qnan
        or ex2_src1_qnan
        or ex2_src0_cnan
+       or ex2_src0_nan
+       or ex2_src1_nan
        or cp0_vpu_xx_dqnan)
 begin
-if(ex2_src0_snan && cp0_vpu_xx_dqnan)
+if(ex2_src0_snan && ex2_src1_snan && cp0_vpu_xx_dqnan)
   ex2_special_sel_1_a[8:0] = {4'b0, 1'b1, 4'b0};  // qnan_src0
-else if(ex2_src1_snan && cp0_vpu_xx_dqnan)
+else if(ex2_src0_snan && ex2_src1_qnan && cp0_vpu_xx_dqnan)
+  ex2_special_sel_1_a[8:0] = {4'b0, 1'b1, 4'b0};  // qnan_src0
+else if(ex2_src0_qnan && ex2_src1_snan && cp0_vpu_xx_dqnan)
   ex2_special_sel_1_a[8:0] = {3'b0, 1'b1, 5'b0};  // qnan_src1
 else if(ex2_src0_qnan && ex2_src1_qnan && !ex2_src0_cnan && cp0_vpu_xx_dqnan)
   ex2_special_sel_1_a[8:0] = {4'b0, 1'b1, 4'b0};  // qnan_src0
-else if(ex2_src0_snan || ex2_src1_snan || ex2_src0_qnan && ex2_src1_qnan)
+else if(ex2_src0_nan && ex2_src1_nan)
   ex2_special_sel_1_a[8:0] = {5'b0, 1'b1, 3'b0};  // cnan
-else if(ex2_src0_qnan)
+else if(ex2_src0_nan)
   ex2_special_sel_1_a[8:0] = {1'b1, 1'b0, 7'b0};  // src1
-else// if(ex2_src1_qnan)
+else// if(ex2_src1_nan)
   ex2_special_sel_1_a[8:0] = {1'b0, 1'b1, 7'b0};  // src0
 // &CombEnd; @158
 end
